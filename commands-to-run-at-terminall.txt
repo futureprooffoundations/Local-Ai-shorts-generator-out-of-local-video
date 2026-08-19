@@ -1,0 +1,6 @@
+
+# video
+python make_short.py --video "C:\Users\abdul\OneDrive\Desktop\streaming\2026-08-19 03-59-00.mkv" --transcript "C:\Users\abdul\OneDrive\Desktop\streaming\2026-08-19 03-59-00.json" --num-clips 3 --code-rect "0,170,1920,610" --webcam-rect "1390,780,530,300"
+
+# transcript forcing english
+whisper "C:\Users\abdul\OneDrive\Desktop\streaming\2026-08-19 03-59-00.mkv" --model medium --language English --output_format json --word_timestamps True --output_dir "C:\Users\abdul\OneDrive\Desktop\streaming"

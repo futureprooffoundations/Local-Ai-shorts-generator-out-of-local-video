@@ -1,0 +1,55 @@
+# --- Python ---
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+build/
+dist/
+
+# --- Secrets / config ---
+.env
+*.key
+*.pem
+
+# --- Media (source videos, generated clips, audio) ---
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.wav
+*.mp3
+*.m4a
+outputs/
+output/
+clips/
+renders/
+temp/
+tmp/
+
+# --- Whisper / model caches ---
+*.pt
+*.bin
+*.safetensors
+*.gguf
+models/
+.cache/
+whisper_cache/
+
+# --- Logs ---
+*.log
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+*.swp
+
+# --- OneDrive sync artifacts ---
+*.tmp
+~$*
