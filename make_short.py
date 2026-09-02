@@ -6,20 +6,34 @@ asks a LOCAL model (via Ollama) to find the best clip-worthy segment(s),
 cuts them, converts to vertical 9:16 (code on top, webcam on bottom),
 and burns in captions.
 
+NEW in this version:
+  - Per-clip webcam/code rect detection using a local VISION model
+    (qwen2.5vl:7b by default, llava:latest as a fallback/alternative),
+    since the cam + screen layout is no longer stationary across a stream.
+    --code-rect / --webcam-rect are now optional manual overrides / fallback
+    if vision detection fails or you pass --no-auto-detect.
+  - Output filenames no longer contain numbers or the word "FINAL" —
+    just a sanitized version of the clip's hook_title, with letter
+    suffixes (_a, _b, ...) added only if two titles collide.
+
 Usage:
     python make_short.py --video "path\\to\\source.mkv" --preview-grid
-    python make_short.py --video "path\\to\\source.mkv" --transcript "path\\to\\source.json" --num-clips 3 --code-rect "x,y,w,h" --webcam-rect "x,y,w,h"
+    python make_short.py --video "path\\to\\source.mkv" --transcript "path\\to\\source.json" --num-clips 3
+    python make_short.py --video "..." --transcript "..." --no-auto-detect --code-rect "x,y,w,h" --webcam-rect "x,y,w,h"
 
 Requires (already in your Ai-shorts .venv):
     pip install requests --break-system-packages
-    ffmpeg on PATH (you already have this)
-    Ollama running locally with a model pulled
+    ffmpeg + ffprobe on PATH (you already have this)
+    Ollama running locally with a ranking model (abod:latest) AND
+    a vision model pulled (qwen2.5vl:7b or llava:latest)
 
 No API key needed - this hits http://localhost:11434 by default.
 """
 
 import argparse
+import base64
 import json
+import string
 import subprocess
 import sys
 from pathlib import Path
@@ -167,6 +181,150 @@ def cut_clip(video_path: Path, start: float, end: float, out_path: Path):
     subprocess.run(cmd, check=True)
 
 
+def get_video_dimensions(video_path: Path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        str(video_path),
+    ]
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    info = json.loads(result.stdout)
+    stream = info["streams"][0]
+    return int(stream["width"]), int(stream["height"])
+
+
+def extract_frame(video_path: Path, out_path: Path, timestamp: float = 1.0):
+    """Grab a single representative frame from a (short) clip to feed the vision model."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(timestamp),
+        "-i", str(video_path),
+        "-frames:v", "1",
+        str(out_path),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+# ---------------------------------------------------------------------------
+# 2b. VISION-BASED RECT DETECTION (per clip — layout is no longer stationary)
+# ---------------------------------------------------------------------------
+
+VISION_PROMPT = """You are looking at a single frame from a coding livestream screen recording.
+
+The frame contains two regions somewhere on screen:
+1. "code_rect": a code editor, terminal, or browser window showing code/text/logs.
+2. "webcam_rect": a smaller rectangular webcam overlay showing a person (face/upper body).
+
+Image dimensions: {width}x{height} pixels. (0,0) is the top-left corner.
+
+Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
+{{"code_rect": {{"x": int, "y": int, "w": int, "h": int}}, "webcam_rect": {{"x": int, "y": int, "w": int, "h": int}}}}
+
+x,y is the top-left corner of the region; w,h is its width and height, all in pixels.
+Do not include any other keys, comments, or explanation.
+"""
+
+
+def _encode_image_b64(path: Path) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def _clamp_rect(rect, width, height):
+    x, y, w, h = rect
+    x = max(0, min(x, width - 1))
+    y = max(0, min(y, height - 1))
+    w = max(1, min(w, width - x))
+    h = max(1, min(h, height - y))
+    return (x, y, w, h)
+
+
+def _rect_is_sane(rect, width, height):
+    x, y, w, h = rect
+    if w <= 0 or h <= 0:
+        return False
+    if w < width * 0.05 or h < height * 0.05:
+        return False  # implausibly tiny — probably a bad detection
+    return True
+
+
+def detect_rects_with_vision(frame_path: Path, width: int, height: int,
+                              model: str = "qwen2.5vl:7b",
+                              ollama_url: str = "http://localhost:11434"):
+    """Ask a local vision model where the code area and webcam box are in this
+    frame. Returns (code_rect, webcam_rect) as (x, y, w, h) tuples, or raises
+    on failure so the caller can fall back to manual/fixed rects."""
+    img_b64 = _encode_image_b64(frame_path)
+    prompt = VISION_PROMPT.format(width=width, height=height)
+
+    response = requests.post(
+        f"{ollama_url}/api/generate",
+        json={
+            "model": model,
+            "prompt": prompt,
+            "images": [img_b64],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.1},
+        },
+        timeout=300,
+    )
+    response.raise_for_status()
+    raw = response.json()["response"].strip()
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+    data = json.loads(raw)  # let this raise if the model gave garbage
+    cr = data["code_rect"]
+    wr = data["webcam_rect"]
+
+    code_rect = (int(cr["x"]), int(cr["y"]), int(cr["w"]), int(cr["h"]))
+    webcam_rect = (int(wr["x"]), int(wr["y"]), int(wr["w"]), int(wr["h"]))
+
+    code_rect = _clamp_rect(code_rect, width, height)
+    webcam_rect = _clamp_rect(webcam_rect, width, height)
+
+    if not _rect_is_sane(code_rect, width, height) or not _rect_is_sane(webcam_rect, width, height):
+        raise ValueError(f"Vision model returned implausible rects: code={code_rect} webcam={webcam_rect}")
+
+    return code_rect, webcam_rect
+
+
+def resolve_rects_for_clip(raw_clip_path: Path, clip_index: int, auto_detect: bool,
+                            vision_model: str, ollama_url: str,
+                            fallback_code_rect, fallback_webcam_rect):
+    """Per-clip rect resolution: try vision detection first (since cam/screen
+    position can change mid-stream), fall back to the fixed rects passed on
+    the CLI (or previously-seen good rects) if detection fails or is disabled."""
+    if not auto_detect:
+        if fallback_code_rect is None or fallback_webcam_rect is None:
+            sys.exit("--no-auto-detect requires --code-rect and --webcam-rect to be set.")
+        return fallback_code_rect, fallback_webcam_rect
+
+    width, height = get_video_dimensions(raw_clip_path)
+    frame_path = raw_clip_path.with_suffix(".detect_frame.png")
+    try:
+        # grab a frame a couple seconds in so intros/transitions don't confuse it
+        extract_frame(raw_clip_path, frame_path, timestamp=1.5)
+        code_rect, webcam_rect = detect_rects_with_vision(
+            frame_path, width, height, model=vision_model, ollama_url=ollama_url
+        )
+        print(f"  Vision-detected rects — code={code_rect} webcam={webcam_rect}")
+        return code_rect, webcam_rect
+    except Exception as e:
+        print(f"  Vision detection failed for clip {clip_index} ({e}).", file=sys.stderr)
+        if fallback_code_rect is not None and fallback_webcam_rect is not None:
+            print("  Falling back to --code-rect/--webcam-rect values.", file=sys.stderr)
+            return fallback_code_rect, fallback_webcam_rect
+        sys.exit(
+            "  No fallback --code-rect/--webcam-rect provided and vision detection failed. "
+            "Either fix the vision model/Ollama connection, or pass fallback rects."
+        )
+    finally:
+        frame_path.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # 3. VERTICAL CONVERTER (true 9:16, code top half / webcam bottom half)
 # ---------------------------------------------------------------------------
@@ -237,7 +395,7 @@ def dump_preview_grid(video_path: Path, out_path: Path, timestamp: float = 30.0)
     print("Read off the top-left corner (x,y) and size (w,h) of:")
     print("  - the code/terminal area you want to keep")
     print("  - your webcam box")
-    print("Then pass them as --code-rect x,y,w,h --webcam-rect x,y,w,h")
+    print("Then pass them as --code-rect x,y,w,h --webcam-rect x,y,w,h (used as fallback rects)")
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +484,46 @@ def burn_captions(video_path: Path, ass_path: Path, out_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# 5. FILE NAMING — no digits, no "final"/"finale", dedup via letters
+# ---------------------------------------------------------------------------
+
+def sanitize_title(title: str) -> str:
+    """Strip everything except letters/spaces/hyphens/underscores, drop any
+    digits, and drop the words 'final'/'finale' (case-insensitive) so the
+    output filename never contains a number or that word."""
+    banned_words = {"final", "finale"}
+    cleaned_chars = []
+    for c in title:
+        if c.isdigit():
+            continue
+        if c.isalpha() or c in " _-":
+            cleaned_chars.append(c)
+    cleaned = "".join(cleaned_chars).strip()
+
+    words = [w for w in cleaned.replace("-", " ").replace("_", " ").split(" ") if w]
+    words = [w for w in words if w.lower() not in banned_words]
+
+    safe = "_".join(words) if words else "clip"
+    return safe
+
+
+def dedupe_name(base_name: str, used_names: set) -> str:
+    if base_name not in used_names:
+        used_names.add(base_name)
+        return base_name
+    for letter in string.ascii_lowercase:
+        candidate = f"{base_name}_{letter}"
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+    candidate = base_name
+    while candidate in used_names:
+        candidate += "_x"
+    used_names.add(candidate)
+    return candidate
+
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -340,10 +538,18 @@ def main():
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--preview-grid", action="store_true",
                          help="Just dump one frame with a coordinate grid, then exit.")
-    parser.add_argument("--code-rect", required=True,
-                         help="x,y,w,h of the code/terminal area in SOURCE pixels")
-    parser.add_argument("--webcam-rect", required=True,
-                         help="x,y,w,h of the webcam box in SOURCE pixels")
+
+    # Rects are now optional: used as a fallback if vision detection is off or fails.
+    parser.add_argument("--code-rect", required=False, default=None,
+                         help="x,y,w,h of the code/terminal area in SOURCE pixels (fallback only)")
+    parser.add_argument("--webcam-rect", required=False, default=None,
+                         help="x,y,w,h of the webcam box in SOURCE pixels (fallback only)")
+
+    parser.add_argument("--no-auto-detect", action="store_true",
+                         help="Disable per-clip vision-based rect detection; require --code-rect/--webcam-rect.")
+    parser.add_argument("--vision-model", default="qwen2.5vl:7b",
+                         help="Ollama vision model tag for detecting code/webcam rects per clip "
+                              "(e.g. qwen2.5vl:7b or llava:latest)")
     args = parser.parse_args()
 
     video_path = Path(args.video)
@@ -358,8 +564,9 @@ def main():
     if transcript_path is None:
         sys.exit("--transcript is required unless you're using --preview-grid")
 
-    code_rect = tuple(int(v) for v in args.code_rect.split(","))
-    webcam_rect = tuple(int(v) for v in args.webcam_rect.split(","))
+    fallback_code_rect = tuple(int(v) for v in args.code_rect.split(",")) if args.code_rect else None
+    fallback_webcam_rect = tuple(int(v) for v in args.webcam_rect.split(",")) if args.webcam_rect else None
+    auto_detect = not args.no_auto_detect
 
     try:
         requests.get(args.ollama_url, timeout=3)
@@ -375,24 +582,33 @@ def main():
     print(f"Asking local model ({args.model}) to find {args.num_clips} clip-worthy segments...")
     clips = rank_segments(segments, args.num_clips, model=args.model, ollama_url=args.ollama_url)
 
+    used_names = set()
+
     for i, clip in enumerate(clips, start=1):
         start, end = clip["start"], clip["end"]
-        title = clip.get("hook_title", f"clip_{i}")
-        safe_title = "".join(c if c.isalnum() or c in " _-" else "" for c in title).strip().replace(" ", "_")
+        title = clip.get("hook_title", "clip")
+        safe_title = sanitize_title(title)
+        safe_name = dedupe_name(safe_title, used_names)
 
         duration = end - start
-        print(f"\n--- Clip {i}: {title} ({start:.1f}s - {end:.1f}s, {duration:.1f}s long) ---")
+        print(f"\n--- Clip: {title} ({start:.1f}s - {end:.1f}s, {duration:.1f}s long) ---")
         print(f"Reason: {clip.get('reason', 'n/a')}")
         if duration > 60:
             print(f"WARNING: this clip is {duration:.1f}s — over 60s clips may not be treated as a Short.")
 
-        raw_clip = output_dir / f"{i:02d}_{safe_title}_raw.mp4"
-        vertical_clip = output_dir / f"{i:02d}_{safe_title}_vertical.mp4"
-        ass_path = output_dir / f"{i:02d}_{safe_title}.ass"
-        final_clip = output_dir / f"{i:02d}_{safe_title}_FINAL.mp4"
+        raw_clip = output_dir / f"{safe_name}_raw.mp4"
+        vertical_clip = output_dir / f"{safe_name}_vertical.mp4"
+        ass_path = output_dir / f"{safe_name}.ass"
+        final_clip = output_dir / f"{safe_name}.mp4"
 
         print("Cutting clip...")
         cut_clip(video_path, start, end, raw_clip)
+
+        print("Resolving code/webcam rects for this clip...")
+        code_rect, webcam_rect = resolve_rects_for_clip(
+            raw_clip, i, auto_detect, args.vision_model, args.ollama_url,
+            fallback_code_rect, fallback_webcam_rect,
+        )
 
         print("Converting to vertical 9:16 (code top / webcam bottom)...")
         convert_to_vertical_split(raw_clip, vertical_clip, code_rect, webcam_rect)
