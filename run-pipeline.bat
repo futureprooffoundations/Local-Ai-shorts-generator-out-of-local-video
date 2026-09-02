@@ -1,7 +1,6 @@
 @echo off
 REM === Edit this one line for each new video ===
-set VIDEO=C:\Users\abdul\Downloads\Video Project 7.mp4
-
+set VIDEO=C:\Users\abdul\OneDrive\Desktop\streaming\2026-09-02 11-33-57.mkv
 REM === Rarely need to touch these ===
 set OUTPUT_DIR=C:\Users\abdul\OneDrive\Desktop\VS-Code\projects\Local-Ai-shorts-generator-out-of-local-video\output
 set NUM_CLIPS=3
