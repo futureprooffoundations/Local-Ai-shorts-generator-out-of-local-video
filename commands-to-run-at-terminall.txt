@@ -3,8 +3,8 @@
 python make_short.py --video "C:\Users\abdul\OneDrive\Desktop\streaming\2026-08-30 00-08-05.mkv" --transcript "C:\Users\abdul\OneDrive\Desktop\VS-Code\projects\Local-Ai-shorts-generator-out-of-local-video\output\2026-08-30 00-08-05.json" --num-clips 3 --code-rect "0,170,1920,610" --webcam-rect "1390,780,530,300"
 
 # transcript forcing english
-whisper "C:\Users\abdul\OneDrive\Desktop\streaming\2026-09-02 00-58-24.mkv" --model medium --language English --output_format json --word_timestamps True --output_dir "C:\Users\abdul\OneDrive\Desktop\VS-Code\projects\Local-Ai-shorts-generator-out-of-local-video\output"
+whisper "C:\Users\abdul\Downloads\Video Project 7.mp4" --model medium --language English --output_format json --word_timestamps True --output_dir "C:\Users\abdul\OneDrive\Desktop\VS-Code\projects\Local-Ai-shorts-generator-out-of-local-video\output"
 
 
 # new command 
-python make_short.py --video "C:\Users\abdul\OneDrive\Desktop\streaming\2026-09-02 00-58-24.mkv" --transcript "C:\Users\abdul\OneDrive\Desktop\VS-Code\projects\Local-Ai-shorts-generator-out-of-local-video\output\2026-09-02 00-58-24.json" --num-clips 3 --vision-model qwen2.5vl:7b --code-rect "0,170,1920,610" --webcam-rect "1390,780,530,300"
+python make_short.py --video "C:\Users\abdul\Downloads\Video Project 7.mp4" --transcript "C:\Users\abdul\OneDrive\Desktop\VS-Code\projects\Local-Ai-shorts-generator-out-of-local-video\output\Video Project 7.json" --num-clips 3 --vision-model qwen2.5vl:7b --code-rect "0,170,1920,610" --webcam-rect "1390,780,530,300"
